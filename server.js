@@ -1,201 +1,258 @@
 const express = require("express");
 const { spawn } = require("child_process");
-const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
 
 const app = express();
 
 const PORT = process.env.PORT || 10000;
-const WIDTH = 32;
-const HEIGHT = 18;
-const FPS = 10;
-const MAX_SECONDS = 30;
 
-const jobs = new Map();
+const WIDTH = 48;
+const HEIGHT = 27;
+const FPS = 12;
+
+const FRAME_SIZE = WIDTH * HEIGHT * 3;
+
+let ytProcess = null;
+let ffmpegProcess = null;
+
+let sequence = 0;
+let ready = false;
+
+const frameQueue = [];
+const MAX_QUEUE = 72;
+
+function stopVideo() {
+    if (ytProcess) {
+        try {
+            ytProcess.kill("SIGKILL");
+        } catch {}
+    }
+
+    if (ffmpegProcess) {
+        try {
+            ffmpegProcess.kill("SIGKILL");
+        } catch {}
+    }
+
+    ytProcess = null;
+    ffmpegProcess = null;
+}
+
+function rgb332(buffer) {
+    const output = Buffer.alloc(WIDTH * HEIGHT);
+
+    let src = 0;
+    let dst = 0;
+
+    while (dst < output.length) {
+        const r = buffer[src];
+        const g = buffer[src + 1];
+        const b = buffer[src + 2];
+
+        const r3 = r >> 5;
+        const g3 = g >> 5;
+        const b2 = b >> 6;
+
+        output[dst] =
+            (r3 << 5) |
+            (g3 << 2) |
+            b2;
+
+        src += 3;
+        dst++;
+    }
+
+    return output.toString("base64");
+}
+
+function startVideo(url) {
+    stopVideo();
+
+    frameQueue.length = 0;
+
+    sequence = 0;
+    ready = false;
+
+    ytProcess = spawn("yt-dlp", [
+        "--no-playlist",
+        "--no-warnings",
+        "-f",
+        "best[height<=360]/best",
+        "-o",
+        "-",
+        url
+    ]);
+
+    ytProcess.on("error", error => {
+        console.error("yt-dlp error:", error);
+        ready = false;
+    });
+
+    ffmpegProcess = spawn("ffmpeg", [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+
+        "-i",
+        "pipe:0",
+
+        "-an",
+
+        "-vf",
+        `fps=${FPS},scale=${WIDTH}:${HEIGHT}:flags=fast_bilinear`,
+
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+
+        "pipe:1"
+    ]);
+
+    ytProcess.stdout.pipe(ffmpegProcess.stdin);
+
+    let buffer = Buffer.alloc(0);
+
+    ffmpegProcess.stdout.on("data", chunk => {
+
+        buffer = Buffer.concat([buffer, chunk]);
+
+        while (buffer.length >= FRAME_SIZE) {
+
+            const raw = buffer.subarray(
+                0,
+                FRAME_SIZE
+            );
+
+            buffer = buffer.subarray(FRAME_SIZE);
+
+            const encoded = rgb332(raw);
+
+            sequence++;
+
+            frameQueue.push({
+                n: sequence,
+                d: encoded
+            });
+
+            if (frameQueue.length > MAX_QUEUE) {
+                frameQueue.shift();
+            }
+
+            ready = true;
+        }
+    });
+
+    ffmpegProcess.on("close", () => {
+        console.log("FFmpeg finished");
+        ready = false;
+    });
+
+    ytProcess.on("close", code => {
+        console.log("yt-dlp finished:", code);
+    });
+}
 
 app.get("/", (req, res) => {
-	res.send("OK");
+    res.json({
+        online: true,
+        width: WIDTH,
+        height: HEIGHT,
+        fps: FPS,
+        ready: ready,
+        queued: frameQueue.length
+    });
 });
 
 app.get("/start", (req, res) => {
-	const url = req.query.url;
 
-	if (!url) {
-		return res.status(400).json({ error: "missing url" });
-	}
+    const url = req.query.url;
 
-	if (!url.includes("youtube.com/") && !url.includes("youtu.be/")) {
-		return res.status(400).json({ error: "invalid youtube url" });
-	}
+    if (!url) {
+        return res.status(400).json({
+            error: "Missing URL"
+        });
+    }
 
-	const id = crypto.randomBytes(8).toString("hex");
-	const dir = path.join("/tmp", id);
-	const video = path.join(dir, "video.mp4");
-	const frames = path.join(dir, "frames.rgb");
+    try {
+        const parsed = new URL(url);
 
-	fs.mkdirSync(dir, { recursive: true });
+        const allowed =
+            parsed.hostname === "youtube.com" ||
+            parsed.hostname === "www.youtube.com" ||
+            parsed.hostname === "m.youtube.com" ||
+            parsed.hostname === "youtu.be";
 
-	jobs.set(id, {
-		status: "downloading",
-		dir,
-		video,
-		frames,
-		frameCount: 0
-	});
+        if (!allowed) {
+            return res.status(400).json({
+                error: "Only YouTube URLs are accepted"
+            });
+        }
+    } catch {
+        return res.status(400).json({
+            error: "Invalid URL"
+        });
+    }
 
-	download(url, video)
-		.then(() => convert(video, frames))
-		.then(frameCount => {
-			const job = jobs.get(id);
+    startVideo(url);
 
-			if (!job) return;
+    res.json({
+        started: true,
+        width: WIDTH,
+        height: HEIGHT,
+        fps: FPS
+    });
+});
 
-			job.status = "ready";
-			job.frameCount = frameCount;
+app.get("/frames", (req, res) => {
 
-			try {
-				fs.unlinkSync(video);
-			} catch {}
-		})
-		.catch(() => {
-			const job = jobs.get(id);
+    let after = Number(req.query.after || 0);
+    let count = Number(req.query.count || 4);
 
-			if (job) {
-				job.status = "error";
-			}
-		});
+    if (!Number.isFinite(after)) {
+        after = 0;
+    }
 
-	res.json({
-		id,
-		width: WIDTH,
-		height: HEIGHT,
-		fps: FPS
-	});
+    if (!Number.isFinite(count)) {
+        count = 4;
+    }
+
+    count = Math.max(1, Math.min(6, Math.floor(count)));
+
+    const result = [];
+
+    for (const frame of frameQueue) {
+
+        if (frame.n > after) {
+
+            result.push(frame);
+
+            if (result.length >= count) {
+                break;
+            }
+        }
+    }
+
+    res.json({
+        width: WIDTH,
+        height: HEIGHT,
+        fps: FPS,
+        ready,
+        frames: result
+    });
 });
 
 app.get("/status", (req, res) => {
-	const job = jobs.get(req.query.id);
 
-	if (!job) {
-		return res.status(404).json({ error: "job not found" });
-	}
-
-	res.json({
-		status: job.status,
-		frames: job.frameCount
-	});
+    res.json({
+        ready,
+        sequence,
+        queued: frameQueue.length,
+        width: WIDTH,
+        height: HEIGHT,
+        fps: FPS
+    });
 });
 
-app.get("/chunk", (req, res) => {
-	const job = jobs.get(req.query.id);
-
-	if (!job || job.status !== "ready") {
-		return res.status(400).json({ error: "not ready" });
-	}
-
-	const start = Math.max(
-		0,
-		parseInt(req.query.start || "0")
-	);
-
-	const count = Math.min(
-		10,
-		Math.max(1, parseInt(req.query.count || "10"))
-	);
-
-	const frameSize = WIDTH * HEIGHT * 3;
-	const file = fs.openSync(job.frames, "r");
-	const result = [];
-
-	try {
-		for (let i = 0; i < count; i++) {
-			const frameNumber = start + i;
-
-			if (frameNumber >= job.frameCount) {
-				break;
-			}
-
-			const buffer = Buffer.alloc(frameSize);
-
-			fs.readSync(
-				file,
-				buffer,
-				0,
-				frameSize,
-				frameNumber * frameSize
-			);
-
-			result.push(buffer.toString("base64"));
-		}
-	} finally {
-		fs.closeSync(file);
-	}
-
-	res.json({
-		start,
-		frames: result
-	});
+app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server listening on ${PORT}`);
 });
-
-function download(url, output) {
-	return new Promise((resolve, reject) => {
-		const p = spawn("yt-dlp", [
-			"--no-playlist",
-			"-f",
-			"worst[ext=mp4]/worst",
-			"--max-filesize",
-			"100M",
-			"-o",
-			output,
-			url
-		]);
-
-		p.on("close", code => {
-			if (code === 0 && fs.existsSync(output)) {
-				resolve();
-			} else {
-				reject();
-			}
-		});
-
-		p.on("error", reject);
-	});
-}
-
-function convert(input, output) {
-	return new Promise((resolve, reject) => {
-		const p = spawn("ffmpeg", [
-			"-hide_banner",
-			"-loglevel",
-			"error",
-			"-i",
-			input,
-			"-t",
-			String(MAX_SECONDS),
-			"-vf",
-			`fps=${FPS},scale=${WIDTH}:${HEIGHT}`,
-			"-f",
-			"rawvideo",
-			"-pix_fmt",
-			"rgb24",
-			output
-		]);
-
-		p.on("close", code => {
-			if (code !== 0 || !fs.existsSync(output)) {
-				reject();
-				return;
-			}
-
-			const frameSize = WIDTH * HEIGHT * 3;
-			const size = fs.statSync(output).size;
-
-			resolve(Math.floor(size / frameSize));
-		});
-
-		p.on("error", reject);
-	});
-}
-
-app.listen(PORT, "0.0.0.0");

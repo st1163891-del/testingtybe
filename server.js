@@ -41,36 +41,34 @@ function rgb332(buffer) {
     const output = Buffer.alloc(WIDTH * HEIGHT);
 
     let src = 0;
-    let dst = 0;
 
-    while (dst < output.length) {
+    for (let i = 0; i < output.length; i++) {
+
         const r = buffer[src];
         const g = buffer[src + 1];
         const b = buffer[src + 2];
 
-        const r3 = r >> 5;
-        const g3 = g >> 5;
-        const b2 = b >> 6;
-
-        output[dst] =
-            (r3 << 5) |
-            (g3 << 2) |
-            b2;
+        output[i] =
+            ((r >> 5) << 5) |
+            ((g >> 5) << 2) |
+            (b >> 6);
 
         src += 3;
-        dst++;
     }
 
     return output.toString("base64");
 }
 
 function startVideo(url) {
+
     stopVideo();
 
     frameQueue.length = 0;
 
     sequence = 0;
     ready = false;
+
+    console.log("Starting video:", url);
 
     ytProcess = spawn("yt-dlp", [
         "--no-playlist",
@@ -81,6 +79,10 @@ function startVideo(url) {
         "-",
         url
     ]);
+
+    ytProcess.stderr.on("data", data => {
+        console.log("yt-dlp:", data.toString());
+    });
 
     ytProcess.on("error", error => {
         console.error("yt-dlp error:", error);
@@ -102,11 +104,16 @@ function startVideo(url) {
 
         "-f",
         "rawvideo",
+
         "-pix_fmt",
         "rgb24",
 
         "pipe:1"
     ]);
+
+    ffmpegProcess.stderr.on("data", data => {
+        console.log("FFmpeg:", data.toString());
+    });
 
     ytProcess.stdout.pipe(ffmpegProcess.stdin);
 
@@ -114,18 +121,26 @@ function startVideo(url) {
 
     ffmpegProcess.stdout.on("data", chunk => {
 
-        buffer = Buffer.concat([buffer, chunk]);
+        buffer = Buffer.concat([
+            buffer,
+            chunk
+        ]);
 
         while (buffer.length >= FRAME_SIZE) {
 
-            const raw = buffer.subarray(
-                0,
-                FRAME_SIZE
-            );
+            const raw =
+                buffer.subarray(
+                    0,
+                    FRAME_SIZE
+                );
 
-            buffer = buffer.subarray(FRAME_SIZE);
+            buffer =
+                buffer.subarray(
+                    FRAME_SIZE
+                );
 
-            const encoded = rgb332(raw);
+            const encoded =
+                rgb332(raw);
 
             sequence++;
 
@@ -142,60 +157,101 @@ function startVideo(url) {
         }
     });
 
-    ffmpegProcess.on("close", () => {
-        console.log("FFmpeg finished");
+    ffmpegProcess.on("close", code => {
+
+        console.log(
+            "FFmpeg stopped:",
+            code
+        );
+
         ready = false;
     });
 
     ytProcess.on("close", code => {
-        console.log("yt-dlp finished:", code);
+
+        console.log(
+            "yt-dlp stopped:",
+            code
+        );
     });
 }
 
 app.get("/", (req, res) => {
+
     res.json({
         online: true,
         width: WIDTH,
         height: HEIGHT,
         fps: FPS,
-        ready: ready,
-        queued: frameQueue.length
+        ready: ready
     });
 });
 
 app.get("/start", (req, res) => {
 
-    const url = req.query.url;
+    console.log("START REQUEST");
+    console.log("Query:", req.query);
+
+    let url = req.query.url;
+
+    if (Array.isArray(url)) {
+        url = url[0];
+    }
+
+    if (typeof url !== "string") {
+
+        return res.status(400).json({
+            ok: false,
+            error: "Missing YouTube URL"
+        });
+    }
+
+    url = url.trim();
 
     if (!url) {
+
         return res.status(400).json({
-            error: "Missing URL"
+            ok: false,
+            error: "Empty YouTube URL"
         });
     }
 
     try {
+
         const parsed = new URL(url);
 
-        const allowed =
-            parsed.hostname === "youtube.com" ||
-            parsed.hostname === "www.youtube.com" ||
-            parsed.hostname === "m.youtube.com" ||
-            parsed.hostname === "youtu.be";
+        const host =
+            parsed.hostname.toLowerCase();
 
-        if (!allowed) {
+        const youtube =
+            host === "youtube.com" ||
+            host === "www.youtube.com" ||
+            host === "m.youtube.com" ||
+            host === "youtu.be" ||
+            host === "www.youtu.be";
+
+        if (!youtube) {
+
             return res.status(400).json({
-                error: "Only YouTube URLs are accepted"
+                ok: false,
+                error: "That is not a YouTube URL",
+                received: url
             });
         }
+
     } catch {
+
         return res.status(400).json({
-            error: "Invalid URL"
+            ok: false,
+            error: "Invalid URL",
+            received: url
         });
     }
 
     startVideo(url);
 
     res.json({
+        ok: true,
         started: true,
         width: WIDTH,
         height: HEIGHT,
@@ -205,8 +261,11 @@ app.get("/start", (req, res) => {
 
 app.get("/frames", (req, res) => {
 
-    let after = Number(req.query.after || 0);
-    let count = Number(req.query.count || 4);
+    let after =
+        Number(req.query.after || 0);
+
+    let count =
+        Number(req.query.count || 4);
 
     if (!Number.isFinite(after)) {
         after = 0;
@@ -216,36 +275,43 @@ app.get("/frames", (req, res) => {
         count = 4;
     }
 
-    count = Math.max(1, Math.min(6, Math.floor(count)));
+    count =
+        Math.max(
+            1,
+            Math.min(
+                6,
+                Math.floor(count)
+            )
+        );
 
-    const result = [];
+    const frames = [];
 
     for (const frame of frameQueue) {
 
         if (frame.n > after) {
 
-            result.push(frame);
+            frames.push(frame);
 
-            if (result.length >= count) {
+            if (frames.length >= count) {
                 break;
             }
         }
     }
 
     res.json({
+        ready: ready,
         width: WIDTH,
         height: HEIGHT,
         fps: FPS,
-        ready,
-        frames: result
+        frames: frames
     });
 });
 
 app.get("/status", (req, res) => {
 
     res.json({
-        ready,
-        sequence,
+        ready: ready,
+        sequence: sequence,
         queued: frameQueue.length,
         width: WIDTH,
         height: HEIGHT,
@@ -254,5 +320,8 @@ app.get("/status", (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server listening on ${PORT}`);
+
+    console.log(
+        "Server running on port " + PORT
+    );
 });

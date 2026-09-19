@@ -66,14 +66,16 @@ function startVideo(url) {
     console.log("================================");
 
     ytProcess = spawn("yt-dlp", [
-        "--no-playlist",
-        "--no-warnings",
-        "-f",
-        "best[height<=360]/best",
-        "-o",
-        "-",
-        url
-    ]);
+    "--no-playlist",
+    "--no-warnings",
+    "--js-runtimes",
+    "node",
+    "-f",
+    "best[height<=360]/best",
+    "-o",
+    "-",
+    url
+]);
 
     ytProcess.stderr.on("data", data => {
         const text = data.toString();
